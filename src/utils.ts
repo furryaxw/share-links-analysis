@@ -715,15 +715,22 @@ async function tryGetRequestForSize(url: string, proxy: string | undefined, user
     });
 }
 
-export async function getEffectiveSettings(ctx: Context, guildId: string | undefined, config: PluginConfig) {
-    if (guildId == undefined) {
+/**
+ * 会话设置的作用域标识：群聊取群号，私聊取频道标识 (如 `private:<userId>`)
+ */
+export function getSettingsScope(session: Session): string | undefined {
+    return session.guildId || session.channelId;
+}
+
+export async function getEffectiveSettings(ctx: Context, scopeId: string | undefined, config: PluginConfig) {
+    if (scopeId == undefined) {
         return {
             parsers: config.default_parsers,
             nsfw: config.allow_sensitive
         };
     }
 
-    const data = await ctx.database.get('sla_group_settings', guildId);
+    const data = await ctx.database.get('sla_group_settings', scopeId);
     const record = data[0]
 
     // 合并：自定义设置覆盖默认

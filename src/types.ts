@@ -19,6 +19,8 @@ export interface ParsedInfo {
     sourceUrl: string;
     stats: string;
     _cache?: ParsedInfoCacheStatus;
+    // 内容被平台标记为敏感：由会话层结合群组设置决定是否展示
+    sensitive?: boolean;
 }
 
 export interface FileInfo {
@@ -60,6 +62,8 @@ export interface PluginConfig {
     parseLimit: number;
     useNumeral: boolean;
     showError: boolean;
+    sensitiveMessage: string;
+    blockedMessage: string;
 
     // CookieCloud 设置
     cookieCloud: {

@@ -2,7 +2,7 @@
 
 import {Context, h, Session} from 'koishi';
 import {FileInfo, Link, ParsedInfo, PluginConfig} from '../types';
-import {escapeHtml, expandShortLink, getEffectiveSettings, numeral} from '../utils';
+import {escapeHtml, expandShortLink, numeral} from '../utils';
 
 export const name = "twitter";
 
@@ -44,7 +44,7 @@ export async function match(content: string, ctx: Context, config: PluginConfig)
         rule.pattern.lastIndex = 0;
         while ((m = rule.pattern.exec(content)) !== null) {
             const id = m[2] || m[1];
-            const url = rule.type === 'short' ? `https://t.co/${id}` : `https://x.com/${m[1]}/status/${id}`;
+            const url = rule.type === 'short' ? `https://t.co/${id}` : `https://x.com/i/status/${id}`;
             initialLinks.push({platform: name, type: rule.type, id, url});
         }
     }
@@ -107,7 +107,7 @@ async function processTweetText(ctx: Context, text: string, tweetId: string, dat
         }
     }
 
-    // 2. 扫描并处理残留的 t.co 短链 (适用于 VxTwitter API 或上一步没清理干净的情况)
+    // 2. 扫描并处理残留的 t.co 短链 (上一步没清理干净的情况)
     const tcoRegex = /https:\/\/t\.co\/\w+/g;
     const matches = processedText.match(tcoRegex);
 
@@ -230,31 +230,60 @@ function extractTweetContent(data: any, config: PluginConfig) {
 }
 
 /**
- * 从 VxTwitter API 数据对象中提取内容
- * 适用于 api.vxtwitter.com 数据结构
+ * 将 FxTwitter 的 raw_text.facets 转换为 entities 结构，供 processTweetText 复用：
+ * media 段用于剔除附件链接，url 段用于替换为展开后的地址
  */
-function extractVxContent(data: any) {
+function facetsToEntities(tweet: any) {
+    const entities: any = {};
+    const facets = tweet?.raw_text?.facets;
+    if (!Array.isArray(facets)) return entities;
+
+    const media = facets
+        .filter((f: any) => f?.type === 'media' && f.original)
+        .map((f: any) => ({url: f.original}));
+    const urls = facets
+        .filter((f: any) => f?.type === 'url' && f.original && f.replacement)
+        .map((f: any) => ({url: f.original, expanded_url: f.replacement}));
+
+    if (media.length > 0) entities.media = media;
+    if (urls.length > 0) entities.urls = urls;
+    return entities;
+}
+
+/**
+ * 从 FxTwitter API 数据对象中提取内容
+ * 适用于 api.fxtwitter.com 的 tweet 结构
+ */
+function extractFxContent(tweet: any) {
     const images: string[] = [];
     const files: FileInfo[] = [];
     let videoPoster = '';
 
-    if (data.media_extended && Array.isArray(data.media_extended)) {
-        for (const media of data.media_extended) {
-            if (media.type === 'image') {
-                images.push(media.url);
-            } else if (media.type === 'video' || media.type === 'gif') {
-                files.push(createTwitterVideoFile(media.url));
-                if (!videoPoster && media.thumbnail_url) {
-                    videoPoster = media.thumbnail_url;
-                }
-            }
+    const mediaList: any[] = Array.isArray(tweet?.media?.all) && tweet.media.all.length > 0
+        ? tweet.media.all
+        : [...(tweet?.media?.photos ?? []), ...(tweet?.media?.videos ?? [])];
+
+    // 同一视频可能返回多种格式，优先取 mp4
+    const videos = mediaList.filter((m: any) => ['video', 'gif', 'animated_gif'].includes(m?.type));
+    const mp4Videos = videos.filter((m: any) => !m.format || m.format === 'mp4');
+    const pickedVideos = mp4Videos.length > 0 ? mp4Videos : videos;
+
+    for (const media of mediaList) {
+        if (media?.type === 'photo' && media.url) images.push(media.url);
+    }
+
+    for (const media of pickedVideos) {
+        const videoUrl = media.url || media.src;
+        if (videoUrl && !files.some(f => f.url === videoUrl)) {
+            files.push(createTwitterVideoFile(videoUrl));
         }
+        if (!videoPoster) videoPoster = media.thumbnail_url || media.poster || media.thumbnail || '';
     }
 
     return {
-        text: data.text || '',
-        screenName: data.user_screen_name || 'unknown',
-        authorName: data.user_name || 'Unknown',
+        text: tweet?.raw_text?.text ?? tweet?.text ?? '',
+        screenName: tweet?.author?.screen_name || 'unknown',
+        authorName: tweet?.author?.name || 'Unknown',
         images,
         files,
         cover: videoPoster
@@ -324,22 +353,6 @@ async function handleSyndicationFallback(
             files.push(...quote.files);
         }
 
-        // 敏感内容检查
-        const settings = await getEffectiveSettings(ctx, session.guildId, config);
-        if (data.possibly_sensitive && !settings.nsfw) {
-            if (config.showError) await session.send('内容包含敏感信息，已停止解析\n如果你是管理员，你可以通过#help share指令获取更多帮助');
-            return {
-                platform: name,
-                title: `@${screenName} 的推文`,
-                authorName,
-                mainbody: escapeHtml("内容包含敏感信息，已停止解析\n如果你是管理员，你可以通过#help share指令获取更多帮助"),
-                sourceUrl: `https://x.com/${screenName}/status/${tweetId}`,
-                stats: statsString,
-                files: [],
-                coverUrl
-            };
-        }
-
         return {
             platform: name,
             title: `@${screenName} 的推文`,
@@ -348,7 +361,8 @@ async function handleSyndicationFallback(
             sourceUrl: `https://x.com/${screenName}/status/${tweetId}`,
             stats: statsString,
             files,
-            coverUrl
+            coverUrl,
+            sensitive: !!data.possibly_sensitive
         };
 
     } catch (e: any) {
@@ -369,10 +383,10 @@ export async function process(
     const logger = ctx.logger(`share-links-analysis:${name}`);
 
     const tweetId = link.id;
-    // 首选: VxTwitter API
+    // 首选: FxTwitter API
     try {
-        const apiUrl = `https://api.vxtwitter.com/Twitter/status/${tweetId}`;
-        logger.debug(`请求 VxAPI: ${apiUrl}`);
+        const apiUrl = `https://api.fxtwitter.com/status/${tweetId}`;
+        logger.debug(`请求 FxTwitter API: ${apiUrl}`);
 
         const reqOptions: any = {
             headers: {
@@ -381,14 +395,19 @@ export async function process(
         };
         if (config.proxy) reqOptions.proxyAgent = config.proxy;
 
-        const data = await ctx.http.get(apiUrl, reqOptions);
+        const payload = await ctx.http.get(apiUrl, reqOptions);
 
-        if (!data) throw new Error('VxAPI 返回无效');
+        if (!payload || payload.code !== 200 || !payload.tweet) {
+            const apiError: any = new Error(`FxTwitter API 返回无效 (code: ${payload?.code ?? 'none'}, message: ${payload?.message ?? 'none'})`);
+            apiError.apiCode = payload?.code;
+            throw apiError;
+        }
 
-        const main = extractVxContent(data);
-        const statsString = `点赞: ${numeral(data.likes, config)} | 评论: ${numeral(data.replies, config)} | 转发: ${numeral(data.retweets, config)}`;
+        const tweet = payload.tweet;
+        const main = extractFxContent(tweet);
+        const statsString = `点赞: ${numeral(tweet.likes, config)} | 评论: ${numeral(tweet.replies, config)} | 转发: ${numeral(tweet.retweets, config)}`;
 
-        let processedMainText = await processTweetText(ctx, main.text, tweetId, data, config);
+        let processedMainText = await processTweetText(ctx, main.text, tweetId, {entities: facetsToEntities(tweet)}, config);
         let mainbody = escapeHtml(processedMainText);
 
         if (main.images.length > 0) {
@@ -399,33 +418,17 @@ export async function process(
         const coverUrl = main.cover;
 
         // 解析引用推文
-        let quoteData = data.qrt
+        const quoteData = tweet.quote;
         if (quoteData) {
-            // 兼容各种返回结构中的 ID 字段
-            const quoteId = quoteData.tweetID || quoteData.tweet_id || "unknown";
-            const quote = extractVxContent(quoteData);
-            const processedQuoteText = await processTweetText(ctx, quote.text, quoteId, quoteData, config);
+            const quoteId = quoteData.id || "unknown";
+            const quote = extractFxContent(quoteData);
+            const processedQuoteText = await processTweetText(ctx, quote.text, quoteId, {entities: facetsToEntities(quoteData)}, config);
 
             mainbody += `\n----------\n[引用 @${quote.screenName}]: ${escapeHtml(processedQuoteText)}`;
             if (quote.images.length > 0) {
                 mainbody += '\n' + quote.images.map(img => h.image(img).toString()).join('\n');
             }
             files.push(...quote.files);
-        }
-
-        // 敏感内容检查 (VxTwitter 返回 possibly_sensitive)
-        const settings = await getEffectiveSettings(ctx, session.guildId, config);
-        if (data.possibly_sensitive && !settings.nsfw) {
-            return {
-                platform: name,
-                title: `@${main.screenName} 的推文`,
-                authorName: main.authorName,
-                mainbody: escapeHtml("内容包含敏感信息，已停止解析\n如果你是管理员，你可以通过#help share指令获取更多帮助"),
-                sourceUrl: `https://x.com/${main.screenName}/status/${tweetId}`,
-                stats: statsString,
-                files: [],
-                coverUrl
-            };
         }
 
         return {
@@ -436,17 +439,17 @@ export async function process(
             sourceUrl: `https://x.com/${main.screenName}/status/${tweetId}`,
             stats: statsString,
             files,
-            coverUrl
+            coverUrl,
+            sensitive: !!tweet.possibly_sensitive
         };
 
     } catch (error: any) {
-        // 如果是 429 (Rate Limit) 或其他非 404 错误，尝试 Fallback 到 Syndication
-        // 404 通常意味着推文真的没了
-        const isNotFound = error.response?.status === 404;
+        // 404 表示推文不存在（HTTP 层或 API 层），其余错误尝试 Fallback 到 Syndication
+        const isNotFound = error.response?.status === 404 || error.apiCode === 404;
 
         if (!isNotFound) {
             const causeDetail = error.cause ? ` (cause: ${error.cause.code || error.cause.message || error.cause})` : '';
-            logger.warn(`VxTwitter API 失败 (${error.message}${causeDetail})，尝试 Syndication API Fallback...`);
+            logger.warn(`FxTwitter API 失败 (${error.message}${causeDetail})，尝试 Syndication API Fallback...`);
             try {
                 return await handleSyndicationFallback(ctx, config, tweetId, session);
             } catch (fallbackError: any) {
@@ -459,7 +462,7 @@ export async function process(
         }
 
         // 最终错误处理
-        if (error.response?.status === 404) {
+        if (isNotFound) {
             await session.send('推文不存在或已被删除');
         } else if (error.response?.status === 429) {
             await session.send('API 请求过频，请稍后');

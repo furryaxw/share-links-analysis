@@ -1,9 +1,9 @@
 // src/index.ts
 
-import {Context, Schema} from 'koishi';
+import {Context, Schema, Session} from 'koishi';
 import {init, parsers, parsers_str, processLink, resolveLinks} from './core';
 import {ParsedInfo, PluginConfig, SlaFileCache, SlaParseCache, SlaParseTimelineNode} from './types';
-import {buildTelemetryEndpoint, getEffectiveSettings, isUserAdmin, sendResult, syncCookiesFromCloud} from './utils';
+import {buildTelemetryEndpoint, escapeHtml, getEffectiveSettings, getSettingsScope, isUserAdmin, sendResult, syncCookiesFromCloud} from './utils';
 import * as fs from 'node:fs';
 import {createHash} from 'node:crypto';
 
@@ -71,6 +71,14 @@ export const Config: Schema<PluginConfig> = Schema.intersect([
         parseLimit: Schema.number().default(3).description("单对话多链接解析上限"),
         useNumeral: Schema.boolean().default(true).description("使用格式化数字 (如 10000 -> 1万)"),
         showError: Schema.boolean().default(false).description("当链接被阻止时提醒发送者"),
+        sensitiveMessage: Schema.string().role('textarea').default(
+            `内容包含敏感信息，已停止解析
+如果你是管理员，你可以通过 help share 指令获取更多帮助`
+        ).description("内容被判定为敏感且当前会话不允许时返回的提示文案。"),
+        blockedMessage: Schema.string().role('textarea').default(
+            `根据策略，该链接已被阻止解析：平台：{platform}
+如果你是管理员，你可以通过 help share 指令获取更多帮助`
+        ).description("链接被会话策略阻止时返回的提示文案。<br/>可用占位符: `{platform}`"),
     }).description("高级解析设置"),
 
     Schema.object({
@@ -856,20 +864,31 @@ export function apply(ctx: Context, config: PluginConfig) {
     }
 
     // 注册指令
+    /**
+     * 会话设置的管理权限：群聊要求管理员，私聊里会话本身就是自己的作用域
+     */
+    const canManageSettings = async (session: Session): Promise<boolean> => {
+        if (!session.guildId) return true;
+        if (!session.userId) return false;
+        return await isUserAdmin(session, session.userId);
+    };
+
     const cmd = ctx.command('share', '分享解析插件配置', {authority: 1})
         .action(async ({session}) => {
-            if (!session?.guildId || !session?.userId) return '该指令只能在群组中使用。';
-            const {parsers, nsfw} = await getEffectiveSettings(ctx, session.guildId, config);
+            const scope = session && getSettingsScope(session);
+            if (!scope) return '当前会话不可用。';
+            const {parsers, nsfw} = await getEffectiveSettings(ctx, scope, config);
             const parserList = Object.entries(parsers)
                 .map(([name, enabled]) => `${enabled ? '✅' : '❌'} ${name}`)
                 .join('\n');
             return `当前解析器状态：\n${parserList}\nNSFW 内容：${nsfw ? '✅' : '❌'}`.trim();
         });
 
-    cmd.subcommand('.parsers [parser:string] [mode:string]', '查看/管理当前群的解析器状态', {authority: 1})
+    cmd.subcommand('.parsers [parser:string] [mode:string]', '查看/管理当前会话的解析器状态', {authority: 1})
         .action(async ({session}, parser, value) => {
-            if (!session?.guildId || !session?.userId) return '该指令只能在群组中使用。';
-            if (!await isUserAdmin(session, session.userId)) return '权限不足'
+            const scope = session && getSettingsScope(session);
+            if (!scope) return '当前会话不可用。';
+            if (!await canManageSettings(session)) return '权限不足'
             type ParserName = typeof parsers_str[number];
             const isValidParser = (name: string): name is ParserName =>
                 (parsers_str as readonly string[]).includes(name);
@@ -878,27 +897,29 @@ export function apply(ctx: Context, config: PluginConfig) {
             if (!value) return '请输入正确的模式';
             const mode = value.trim().toLowerCase() === 'true'
 
-            const data = await ctx.database.get('sla_group_settings', session.guildId);
+            const data = await ctx.database.get('sla_group_settings', scope);
             const final_parsers = {...data[0]?.custom_parsers, ...{[parser]: mode}};
-            const record = {guildId: session.guildId, custom_parsers: final_parsers};
+            const record = {guildId: scope, custom_parsers: final_parsers};
             await ctx.database.upsert('sla_group_settings', [record]);
         });
 
     cmd.subcommand('.nsfw [value:string]', '设置是否允许 NSFW 内容', {authority: 1})
         .action(async ({session}, value) => {
-            if (!session?.guildId || !session?.userId) return '该指令只能在群组中使用。';
-            if (!await isUserAdmin(session, session.userId)) return '权限不足'
+            const scope = session && getSettingsScope(session);
+            if (!scope) return '当前会话不可用。';
+            if (!await canManageSettings(session)) return '权限不足'
             const mode = value.trim().toLowerCase() === 'true'
-            const record = {guildId: session.guildId, nsfw_enabled: mode};
+            const record = {guildId: scope, nsfw_enabled: mode};
             await ctx.database.upsert('sla_group_settings', [record]);
             await session.execute('share');
         });
 
     cmd.subcommand('.reset', '重置为全局默认设置', {authority: 1})
         .action(async ({session}) => {
-            if (!session?.guildId || !session?.userId) return '该指令只能在群组中使用。';
-            if (!await isUserAdmin(session, session.userId)) return '权限不足'
-            await ctx.database.remove('sla_group_settings', {guildId: session.guildId});
+            const scope = session && getSettingsScope(session);
+            if (!scope) return '当前会话不可用。';
+            if (!await canManageSettings(session)) return '权限不足'
+            await ctx.database.remove('sla_group_settings', {guildId: scope});
             return '已重置为全局默认设置。';
         });
 
@@ -1250,19 +1271,13 @@ export function apply(ctx: Context, config: PluginConfig) {
 
         let linkCount = 0;
         for (const link of links) {
-            if (session.guildId) {
-                const settings = await getEffectiveSettings(ctx, session.guildId, config)
-                if (!settings.parsers[link.platform]) {
-                    logger.debug(`根据策略，该链接已被阻止解析：平台：${link.platform}，链接：${link.url}`);
-                    if (config.showError) await session.send(`根据策略，该链接已被阻止解析：平台：${link.platform}\n如果你是管理员，你可以通过#help share指令获取更多帮助`);
-                    continue
-                }
-            } else {
-                if (!config.default_parsers[link.platform as keyof typeof config.default_parsers]) {
-                    logger.debug(`根据策略，该链接已被阻止解析：平台：${link.platform}，链接：${link.url}`);
-                    if (config.showError) await session.send(`根据策略，该链接已被阻止解析：平台：${link.platform}`);
-                    continue
-                }
+            // 会话策略（群组自定义或全局默认）在解析前后都要用到，这里取一次
+            const settings = await getEffectiveSettings(ctx, getSettingsScope(session), config);
+
+            if (!settings.parsers[link.platform]) {
+                logger.debug(`根据策略，该链接已被阻止解析：平台：${link.platform}，链接：${link.url}`);
+                if (config.showError) await session.send(config.blockedMessage.replace(/\{platform\}/g, link.platform));
+                continue
             }
 
             if (linkCount >= config.parseLimit) {
@@ -1441,6 +1456,15 @@ export function apply(ctx: Context, config: PluginConfig) {
 
                 if (result) {
                     lastProcessedUrls[channelId][link.url] = Date.now();
+                    // 敏感内容在会话层统一拦截：解析结果来自缓存时同样要过这一关
+                    if (result.sensitive && !settings.nsfw) {
+                        result = {
+                            ...result,
+                            mainbody: escapeHtml(config.sensitiveMessage),
+                            coverUrl: undefined,
+                            files: []
+                        };
+                    }
                     await sendResult(ctx, session, config, result, logger, sendStats);
                 } else {
                     status = "failed";
