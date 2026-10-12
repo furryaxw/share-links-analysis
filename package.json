@@ -2,7 +2,7 @@
   "name": "koishi-plugin-share-links-analysis",
   "description": "Koishi 多平台分享链接解析插件，支持内容预览、媒体提取与缓存。",
   "license": "MIT",
-  "version": "0.15.2",
+  "version": "0.15.3",
   "main": "lib/index.js",
   "typings": "lib/index.d.ts",
   "files": [
