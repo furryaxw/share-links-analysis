@@ -1,11 +1,11 @@
 // src/parsers/xiaohongshu.ts
 
-import {Context, h, Session} from 'koishi';
+import {Context, h, Logger, Session} from 'koishi';
 import {FileInfo, Link, ParsedInfo, PluginConfig, XhsInitialState} from '../types';
 // @ts-ignore
 import {Cookie, Page} from 'puppeteer';
 import {load} from 'cheerio';
-import {escapeHtml, expandShortLink, getCookie, numeral} from '../utils';
+import {escapeHtml, getCookie, numeral} from '../utils';
 
 export const name = "xiaohongshu";
 
@@ -57,6 +57,8 @@ export async function match(content: string, ctx: Context, config: PluginConfig)
             if (!url.startsWith('http')) {
                 url = `https://${url}`;
             }
+            // 分享链接的追踪参数不进入后续请求、日志与去重键
+            url = buildNoteUrl(url, parseNoteLink(url).xsecToken);
             initialLinks.push({platform: name, type, id: cleanId, url});
         }
     }
@@ -68,15 +70,10 @@ export async function match(content: string, ctx: Context, config: PluginConfig)
         let finalLink = link;
 
         if (link.type === 'short') {
-            const finalUrl = await expandShortLink(ctx, link.url, config, logger, proxy);
-
-            if (finalUrl) {
-                const idMatch = finalUrl.match(/\/explore\/([\w?=&\-.%]+)/) || finalUrl.match(/\/discovery\/item\/([\w?=&\-.%]+)/);
-                if (idMatch) {
-                    const cleanId = idMatch[1].split('?')[0];
-                    // 依然保留 finalUrl，因为 process 还需要提 xsec_token
-                    finalLink = {platform: name, type: 'explore', id: cleanId, url: finalUrl};
-                }
+            // 短链只需第一跳的 Location，里面带着笔记地址与 xsec_token
+            const resolved = await resolveShareLink(ctx, link.url, config, logger, proxy);
+            if (resolved.noteId) {
+                finalLink = {platform: name, type: 'explore', id: resolved.noteId, url: resolved.noteUrl};
             }
         }
 
@@ -168,6 +165,163 @@ export async function lc_get_cookie(ctx: Context, config: PluginConfig): Promise
 }
 
 /**
+ * 从分享链接中解析出笔记 ID 与完整笔记地址。
+ * 短链只跟随第一跳 (xhslink.com 的 Location 里已经带着完整地址和 token)，不需要登录态。
+ */
+async function resolveShareLink(
+    ctx: Context,
+    url: string,
+    config: PluginConfig,
+    logger: Logger,
+    proxy?: string
+): Promise<{noteId?: string; xsecToken?: string; noteUrl: string}> {
+    const direct = parseNoteLink(url);
+    if (direct.noteId) return {...direct, noteUrl: url};
+
+    try {
+        const options: any = {
+            method: 'GET',
+            redirect: 'manual',
+            headers: {'User-Agent': config.userAgent},
+        };
+        if (proxy) options.proxyAgent = proxy;
+        const response = await ctx.http(url, options);
+        const location = (response.headers as any)?.get?.('location');
+        if (location) {
+            const noteUrl = new URL(String(location), url).toString();
+            const parsed = parseNoteLink(noteUrl);
+            if (parsed.noteId) return {...parsed, noteUrl};
+        }
+        logger.debug(`短链未返回可识别的笔记地址: ${url}`);
+    } catch (error: any) {
+        logger.debug(`展开短链失败: ${url} - ${error.message}`);
+    }
+    return {noteUrl: url};
+}
+
+/** 从笔记地址里取出笔记 ID 与 xsec_token */
+function parseNoteLink(url: string): {noteId?: string; xsecToken?: string} {
+    try {
+        const parsed = new URL(url.replace(/&amp;/g, '&'));
+        return {
+            noteId: parsed.pathname.match(/\/(?:explore|discovery\/item)\/([a-zA-Z0-9]+)/)?.[1],
+            xsecToken: parsed.searchParams.get('xsec_token') || undefined,
+        };
+    } catch (e) {
+        // 不是标准 URL 时按未解析处理
+        return {};
+    }
+}
+
+/** 分享链接里的追踪参数既不带到请求上，也不带到 sourceUrl，只保留笔记地址与 xsec_token */
+function buildNoteUrl(noteUrl: string, xsecToken?: string): string {
+    try {
+        const target = new URL(noteUrl);
+        target.search = '';
+        if (xsecToken) target.searchParams.set('xsec_token', xsecToken);
+        return target.toString();
+    } catch (e) {
+        return noteUrl;
+    }
+}
+
+// 小红书对非浏览器客户端会直接跳登录页，但页面本身（SSR 数据）不需要登录态，
+// 因此常驻一个浏览器页面，用它做同源请求拿页面内容。
+let transportPage: Page | null = null;
+let injectedCookie = '';
+
+async function getTransportPage(ctx: Context, config: PluginConfig, logger: Logger): Promise<Page> {
+    if (transportPage && !transportPage.isClosed()) return transportPage;
+
+    const page = await ctx.puppeteer.page();
+    await page.setUserAgent(config.userAgent);
+
+    const cookieStr = await getCookie(ctx, config, name);
+    if (cookieStr) {
+        const cookies = cookieStr.split(';').map((pair) => {
+            const [cookieName, ...cookieValue] = pair.trim().split('=');
+            return {name: cookieName, value: cookieValue.join('='), domain: '.xiaohongshu.com'};
+        }).filter(cookie => cookie.name);
+        if (cookies.length > 0) await page.setCookie(...cookies as any);
+        injectedCookie = cookieStr;
+    }
+
+    await page.goto('https://www.xiaohongshu.com/explore', {waitUntil: 'domcontentloaded', timeout: 20000});
+    logger.debug('小红书请求页面已就绪');
+    transportPage = page;
+    return page;
+}
+
+/**
+ * 借浏览器内核取笔记页 HTML：Node 直连会被风控打到登录页，浏览器指纹的同源请求则正常返回
+ */
+async function fetchNoteHtml(ctx: Context, config: PluginConfig, logger: Logger, noteUrl: string): Promise<string> {
+    let lastError: Error | null = null;
+    for (let attempt = 1; attempt <= 2; attempt++) {
+        try {
+            const page = await getTransportPage(ctx, config, logger);
+
+            const cookieStr = await getCookie(ctx, config, name);
+            if (cookieStr && cookieStr !== injectedCookie) {
+                const cookies = cookieStr.split(';').map((pair) => {
+                    const [cookieName, ...cookieValue] = pair.trim().split('=');
+                    return {name: cookieName, value: cookieValue.join('='), domain: '.xiaohongshu.com'};
+                }).filter(cookie => cookie.name);
+                if (cookies.length > 0) await page.setCookie(...cookies as any);
+                injectedCookie = cookieStr;
+            }
+
+            const result = await page.evaluate(async (target: string) => {
+                const response = await fetch(target, {credentials: 'include'});
+                return {status: response.status, url: response.url, text: await response.text()};
+            }, noteUrl);
+
+            if (result.status >= 400) throw new Error(`页面返回状态码 ${result.status}`);
+            if (result.url.includes('/login')) throw new Error('被跳转到登录页');
+            if (result.url.includes('/404')) throw new Error('笔记页面不存在：链接缺少 xsec_token 或笔记已被删除');
+            return result.text;
+        } catch (error: any) {
+            lastError = error;
+            logger.debug(`获取小红书页面失败 (第 ${attempt} 次): ${error.message}`);
+            if (transportPage) {
+                try {
+                    await transportPage.close();
+                } catch (e) {
+                }
+                transportPage = null;
+                injectedCookie = '';
+            }
+        }
+    }
+    throw lastError ?? new Error('获取小红书页面失败');
+}
+
+/**
+ * 短链兜底：页面内 fetch 到 xhslink.com 属跨源会被拦，改为直接导航，
+ * 再从最终地址里取出带 xsec_token 的笔记地址。
+ */
+async function followShortLink(ctx: Context, config: PluginConfig, logger: Logger, shortUrl: string): Promise<{noteId?: string; xsecToken?: string; noteUrl: string}> {
+    const page = await getTransportPage(ctx, config, logger);
+    await page.goto(shortUrl, {waitUntil: 'domcontentloaded', timeout: 20000});
+
+    const finalUrl = page.url();
+    const parsed = parseNoteLink(finalUrl);
+    if (!parsed.noteId) {
+        throw new Error(`短链未指向笔记页面（${finalUrl}），可能已失效或不是分享链接`);
+    }
+    logger.debug(`短链已跳转到: ${finalUrl}`);
+    return {...parsed, noteUrl: finalUrl};
+}
+
+export async function init(ctx: Context, config: PluginConfig) {
+    ctx.on('dispose', () => {
+        transportPage?.close().catch(() => undefined);
+        transportPage = null;
+        injectedCookie = '';
+    });
+}
+
+/**
  * 处理单个小红书链接
  * @param ctx Koishi Context
  * @param config 插件配置
@@ -177,54 +331,34 @@ export async function lc_get_cookie(ctx: Context, config: PluginConfig): Promise
  */
 export async function process(ctx: Context, config: PluginConfig, link: Link, session: Session): Promise<ParsedInfo | null> {
     const logger = ctx.logger(`share-links-analysis:${name}`);
+    const proxy = config.proxy_settings[name] ? config.proxy : undefined;
 
-    // 步骤一：从原始分享链接中提取 xsec_token
-    let token: string | null = null;
+    // 步骤一：解析笔记地址（短链会解析出带 xsec_token 的真实笔记地址）
+    const resolved = await resolveShareLink(ctx, link.url, config, logger, proxy);
+    let noteId = resolved.noteId ?? link.id;
+    let xsecToken = resolved.xsecToken;
+    let noteUrl = resolved.noteUrl;
+
+    // 步骤二：取笔记页 HTML 并解析页面数据
+    let responseHtml: string;
     try {
-        // 解码URL中的HTML实体, 主要是 &amp; -> &
-        const decodedUrl = link.url.replace(/&amp;/g, '&');
-        const originalUrl = new URL(decodedUrl);
-        token = originalUrl.searchParams.get('xsec_token');
-        if (token) {
-            logger.debug(`成功从分享链接中提取 xsec_token。`);
-        } else {
-            logger.debug(`分享链接中未找到 xsec_token: ${link.url}`);
+        if (!resolved.noteId) {
+            // Node 侧拿不到跳转目标时交给浏览器跟随短链跳转
+            const followed = await followShortLink(ctx, config, logger, link.url);
+            noteUrl = followed.noteUrl;
+            noteId = followed.noteId ?? noteId;
+            xsecToken = followed.xsecToken ?? xsecToken;
         }
-    } catch (e) {
-        logger.debug(`解析分享链接URL失败: ${link.url}`);
-    }
-
-    let finalUrl = link.url;
-
-    // 步骤二：构建最终要抓取的URL
-    let urlToFetch: string;
-    try {
-        const baseUrl = finalUrl.split('?')[0];
-        if (token) {
-            const targetUrl = new URL(baseUrl);
-            targetUrl.searchParams.set('xsec_token', token);
-            urlToFetch = targetUrl.toString();
-        } else {
-            urlToFetch = finalUrl;
-        }
-    } catch (e) {
-        logger.error(`构建最终请求URL失败: ${finalUrl}`);
+        // 请求与 sourceUrl 都只保留笔记地址与 xsec_token，不带分享链接的追踪参数
+        noteUrl = buildNoteUrl(noteUrl, xsecToken);
+        logger.debug(`正在获取小红书笔记页: ${noteUrl}`);
+        responseHtml = await fetchNoteHtml(ctx, config, logger, noteUrl);
+    } catch (error: any) {
+        logger.error(`获取小红书页面失败: ${error.message}`);
         return null;
     }
 
-    logger.debug(`正在抓取小红书页面: ${urlToFetch}`);
     try {
-        const cookie = await getCookie(ctx, config, name);
-        const requestHeaders: Record<string, string> = {
-            'User-Agent': config.userAgent,
-            'Cookie': cookie,
-            'Referer': 'https://www.xiaohongshu.com/',
-        };
-
-        const fullResponse = await ctx.http(urlToFetch, {method: 'GET', headers: requestHeaders});
-
-        const responseHtml = fullResponse.data;
-
         const $ = load(responseHtml);
         const scriptContent = $('script:contains("window.__INITIAL_STATE__")').html();
 
@@ -235,7 +369,7 @@ export async function process(ctx: Context, config: PluginConfig, link: Link, se
 
         const jsonStr = scriptContent.replace(/window\.__INITIAL_STATE__\s*=\s*/, '').replace(/undefined/g, 'null');
         const pageData = JSON.parse(jsonStr) as XhsInitialState;
-        const noteKey = Object.keys(pageData.note.noteDetailMap)[0];
+        const noteKey = Object.keys(pageData.note?.noteDetailMap ?? {})[0];
         if (!noteKey) {
             logger.error('无法在页面数据中找到笔记详情。');
             return null;
@@ -259,7 +393,7 @@ export async function process(ctx: Context, config: PluginConfig, link: Link, se
             if (noteData.imageList && noteData.imageList.length > 0) {
                 coverUrl = noteData.imageList[0].infoList.find(i => i.imageScene === 'WB_DETAIL_SHARE')?.url || noteData.imageList[0].infoList[1]?.url;
             }
-        } else if (noteData.type === 'normal' && Array.isArray(noteData.imageList)) {
+        } else if (Array.isArray(noteData.imageList)) {
             noteData.imageList.forEach((img) => {
                 const imageUrl = img.infoList.find((i) => i.imageScene === 'WB_DETAIL_SHARE')?.url || img.infoList[1]?.url || img.url_default;
                 if (imageUrl) {
@@ -286,13 +420,13 @@ export async function process(ctx: Context, config: PluginConfig, link: Link, se
         }
 
         // 组装 Mainbody
-        const image = images ? images.map(img => h.image(img).toString()).join('\n') : ''
+        const image = images.length > 0 ? images.map(img => h.image(img).toString()).join('\n') : '';
         // 将 描述 + 标签 + 时间 + 图片 组合
         const mainbody = `${escapeHtml(noteData.desc.trim())}\n\n${tags}${timeString}\n` + image;
 
         let files: FileInfo[] = [];
         if (videoUrl) {
-            files = [createXhsVideoFile(link.id, videoUrl)];
+            files = [createXhsVideoFile(noteId, videoUrl)];
         }
 
         return {
@@ -302,12 +436,12 @@ export async function process(ctx: Context, config: PluginConfig, link: Link, se
             mainbody: mainbody,
             coverUrl: coverUrl,
             files: files,
-            sourceUrl: urlToFetch,
+            sourceUrl: noteUrl,
             stats: statsString,
         };
 
     } catch (error: any) {
-        logger.error(`抓取或解析小红书页面时失败: ${error.message}`);
+        logger.error(`解析小红书页面数据时失败: ${error.message}`);
         return null;
     }
 }
