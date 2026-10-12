@@ -88,7 +88,7 @@ Output/telemetry behavior:
 The plugin relies on Koishi built-in services, not direct npm dependencies:
 
 - `ctx.http` for HTTP requests with optional proxy agent.
-- `ctx.puppeteer` for headless browser scraping, such as Xiaohongshu cookie refresh and Xiaoheihe rendering.
+- `ctx.puppeteer` for headless browser scraping, such as Xiaohongshu note pages and cookie refresh.
 - `ctx.database` for cache, group settings, and cookie storage.
 - `bot.sendForwardMsg` from the OneBot adapter for forward-mode result delivery.
 

@@ -1,10 +1,9 @@
 // src/parsers/xiaoheihe.ts
 
+import {createHash, randomBytes} from 'crypto';
 import {Context, h, Session} from 'koishi';
-import {ContentBlock, Link, ParsedInfo, PluginConfig, XiaoHeiHePostData} from '../types';
-import {escapeHtml, getCookie, numeral} from '../utils';
-// @ts-ignore
-import {HTTPRequest, Page} from 'puppeteer'
+import {Link, ParsedInfo, PluginConfig, XiaoHeiHeLink, XiaoHeiHeTreeResponse} from '../types';
+import {escapeHtml, numeral} from '../utils';
 
 export const name = "xiaoheihe";
 
@@ -24,11 +23,11 @@ function createXiaoHeiheVideoFile(linkId: string, url: string): { type: 'video',
 
 const linkRules = [
     {
-        pattern: /https?:\/\/api\.xiaoheihe\.cn\/v3\/bbs\/app\/api\/web\/share\?[^"'\s]*?\blink_id=([a-zA-Z0-9]+)/gi,
+        pattern: /(?:https?:\/\/)?(?:[\w-]+\.)?xiaoheihe\.cn\/v3\/bbs\/app\/api\/web\/share\?[^"'\s]*?\blink_id=([a-zA-Z0-9]+)/gi,
         type: "bbs_api" as const,
     },
     {
-        pattern: /https?:\/\/www\.xiaoheihe\.cn\/app\/bbs\/link\/([a-zA-Z0-9]+)/gi,
+        pattern: /(?:https?:\/\/)?(?:[\w-]+\.)?xiaoheihe\.cn\/app\/bbs\/link\/([a-zA-Z0-9]+)/gi,
         type: "bbs" as const,
     }
 ];
@@ -53,6 +52,146 @@ export async function match(content: string, ctx: Context, config: PluginConfig)
     return results;
 }
 
+// ===== 接口签名 =====
+// api.xiaoheihe.cn 的 hkey 只由 (接口路径, _time + 1, nonce) 决定，没有密钥：
+// 三个映射串交错取前 20 个字符做 MD5，摘要前 5 位再映射一次，摘要后 6 位做一轮混淆后取模补成两位校验码。
+const SIGN_ALPHABET = 'AB45STUVWZEFGJ6CH01D237IXYPQRKLMN89';
+
+function mixByte(value: number): number {
+    return value & 128 ? ((value << 1) ^ 27) & 255 : value << 1;
+}
+
+function mix1(value: number): number {
+    return mixByte(value) ^ value;
+}
+
+function mix2(value: number): number {
+    return mix1(mixByte(value));
+}
+
+function mix3(value: number): number {
+    return mix2(mix1(mixByte(value)));
+}
+
+function mix4(value: number): number {
+    return mix3(value) ^ mix2(value) ^ mix1(value);
+}
+
+function scramble(codes: number[]): number[] {
+    const next = [0, 0, 0, 0];
+    next[0] = mix4(codes[0]) ^ mix3(codes[1]) ^ mix2(codes[2]) ^ mix1(codes[3]);
+    next[1] = mix1(codes[0]) ^ mix4(codes[1]) ^ mix3(codes[2]) ^ mix2(codes[3]);
+    next[2] = mix2(codes[0]) ^ mix1(codes[1]) ^ mix4(codes[2]) ^ mix3(codes[3]);
+    next[3] = mix3(codes[0]) ^ mix2(codes[1]) ^ mix1(codes[2]) ^ mix4(codes[3]);
+    codes[0] = next[0];
+    codes[1] = next[1];
+    codes[2] = next[2];
+    codes[3] = next[3];
+    return codes;
+}
+
+/** 按字符码取模映射到签名字母表，trimEnd 对应原实现里对字母表尾部的裁剪 */
+function mapChars(source: string, trimEnd = 0): string {
+    const alphabet = trimEnd ? SIGN_ALPHABET.slice(0, -trimEnd) : SIGN_ALPHABET;
+    let result = '';
+    for (let index = 0; index < source.length; index++) {
+        result += alphabet[source.charCodeAt(index) % alphabet.length];
+    }
+    return result;
+}
+
+function interleave(parts: string[]): string {
+    let result = '';
+    const maxLength = Math.max(...parts.map(part => part.length));
+    for (let index = 0; index < maxLength; index++) {
+        for (const part of parts) {
+            if (index < part.length) result += part[index];
+        }
+    }
+    return result;
+}
+
+function createHkey(apiPath: string, time: number, nonce: string): string {
+    const normalizedPath = '/' + apiPath.split('/').filter(Boolean).join('/') + '/';
+    const seed = interleave([
+        mapChars(String(time), 2),
+        mapChars(normalizedPath),
+        mapChars(nonce),
+    ]).slice(0, 20);
+    const digest = createHash('md5').update(seed).digest('hex');
+    const checksum = scramble(digest.slice(-6).split('').map(char => char.charCodeAt(0)))
+        .reduce((sum, value) => sum + value, 0) % 100;
+    return mapChars(digest.slice(0, 5), 4) + String(checksum).padStart(2, '0');
+}
+
+function readTagName(tag: any): string {
+    if (typeof tag === 'string') return tag.trim();
+    return String(tag?.text ?? '').trim();
+}
+
+function decodeEntities(value: string): string {
+    return value
+        .replace(/&nbsp;/gi, ' ')
+        .replace(/&lt;/gi, '<')
+        .replace(/&gt;/gi, '>')
+        .replace(/&quot;/gi, '"')
+        .replace(/&#0?39;/g, "'")
+        .replace(/&amp;/gi, '&');
+}
+
+/**
+ * 帖子正文是富文本块：一个 JSON 数组，每块的 text 是带 <p>/<img> 的 HTML，图片只存在于 HTML 里。
+ * 返回拼好的正文（文字已转义、图片为 h.image）与按出现顺序收集的图片地址。
+ */
+function parseRichText(raw: any): {body: string, images: string[]} {
+    let blocks: any[];
+    if (Array.isArray(raw)) {
+        blocks = raw;
+    } else if (typeof raw === 'string' && raw.trim()) {
+        try {
+            const parsed = JSON.parse(raw);
+            blocks = Array.isArray(parsed) ? parsed : [parsed];
+        } catch (e) {
+            blocks = [{text: raw}];
+        }
+    } else {
+        blocks = [];
+    }
+
+    let body = '';
+    const images: string[] = [];
+    for (const block of blocks) {
+        const html = typeof block?.text === 'string' ? block.text : '';
+        if (!html) continue;
+
+        for (const segment of html.split(/<\/p>|<br\s*\/?>/i)) {
+            const imageUrl = segment.match(/<img[^>]+data-original=["']([^"']+)["']/i)?.[1]
+                ?? segment.match(/<img[^>]+src=["']([^"']+)["']/i)?.[1];
+
+            if (imageUrl) {
+                const decoded = decodeEntities(imageUrl);
+                images.push(decoded);
+                body += h.image(decoded).toString();
+                continue;
+            }
+
+            const text = decodeEntities(segment.replace(/<[^>]*>/g, '')).trim();
+            if (text) body += escapeHtml(text + '\n');
+        }
+    }
+    return {body, images};
+}
+
+function readCount(source: XiaoHeiHeLink, keys: string[]): number | null {
+    for (const key of keys) {
+        const value = (source as any)?.[key];
+        if (value === undefined || value === null || value === '') continue;
+        const parsed = typeof value === 'number' ? value : parseInt(String(value), 10);
+        if (!Number.isNaN(parsed)) return parsed;
+    }
+    return null;
+}
+
 export async function process(
     ctx: Context,
     config: PluginConfig,
@@ -61,331 +200,101 @@ export async function process(
 ): Promise<ParsedInfo | null> {
     const logger = ctx.logger(`share-links-analysis:${name}`);
 
-    const url = link.url
-    let page: Page | null = null;
+    // 步骤一：生成接口签名参数
+    const now = Date.now();
+    const apiPath = '/bbs/app/link/tree';
+    const time = Math.floor(now / 1000);
+    const nonce = createHash('md5')
+        .update(`${time}${now}${Math.random()}${randomBytes(8).toString('hex')}`)
+        .digest('hex')
+        .toUpperCase();
+
+    const params = new URLSearchParams({
+        app: 'heybox',
+        os_type: 'web',
+        x_app: 'heybox_website',
+        x_client_type: 'web',
+        x_os_type: 'Windows',
+        x_client_version: '',
+        client_type: 'web',
+        web_version: '3.0',
+        version: '999.0.4',
+        hkey: createHkey(apiPath, time + 1, nonce),
+        _time: String(time),
+        nonce: nonce,
+        link_id: link.id,
+        is_first: '1',
+        page: '1',
+        index: '1',
+        limit: '20',
+        owner_only: '0',
+    });
+
+    // 步骤二：请求帖子接口
+    logger.debug(`正在请求小黑盒接口: ${link.id}`);
+    let payload: XiaoHeiHeTreeResponse;
     try {
-        page = await ctx.puppeteer.page();
-        await page.setUserAgent(config.userAgent)
-
-        // 加载并注入 Cookie
-        const cookieStr = await getCookie(ctx, config, name);
-        if (cookieStr) {
-            // Puppeteer 需要对象数组格式的 Cookie
-            const cookies = cookieStr.split(';').map(pair => {
-                const [cookieName, ...cookieValue] = pair.trim().split('=');
-                return {
-                    name: cookieName,
-                    value: cookieValue.join('='),
-                    domain: '.xiaoheihe.cn' // 必须指定正确的 domain
-                };
-            }).filter(c => c.name); // 过滤空值
-
-            if (cookies.length > 0) {
-                await page.setCookie(...cookies);
-            }
-        }
-
-        // 设置请求拦截（阻止非必要资源加载加速解析）
-        await page.setRequestInterception(true)
-        page.on('request', (req: HTTPRequest) => {
-            const resourceType = req.resourceType()
-
-            // 必须加载的资源
-            if (url.includes('/app/community/detail/') ||
-                url.includes('heybox-bbs') ||
-                url.includes('heybox-common') ||
-                resourceType === 'xhr' ||
-                resourceType === 'script') {
-                req.continue()
-                return
-            }
-
-            // 阻止非必要资源
-            if (['image', 'stylesheet', 'font', 'media'].includes(resourceType) &&
-                !url.includes('avatar') &&
-                !url.includes('thumb')) {
-                req.abort()
-            } else {
-                req.continue()
-            }
-        })
-
-        // 导航到目标页面
-        const response = await Promise.race([
-            page.goto(link.url, {waitUntil: 'networkidle2', timeout: 10000}),
-            new Promise((_, reject) =>
-                setTimeout(() => reject(new Error('页面加载超时')), 10000)
-            )
-        ])
-
-        if (!response || response.status() !== 200) {
-            throw new Error(`页面加载失败，状态码: ${response?.status() || '未知'}`)
-        }
-
-        // 智能等待 - 适配三种布局
-        await Promise.race([
-            page.waitForFunction(() => {
-                const hasImageText = !!document.querySelector('.hb-bbs-image-text');
-                const hasPost = !!document.querySelector('.hb-bbs-post');
-
-                const videoBox = document.querySelector('.hb-bbs__video');
-                let isVideoReady = false;
-                if (videoBox) {
-                    const v = videoBox.querySelector('video') as HTMLVideoElement;
-                    // 只要 video 标签有了 src，或者它内部长出了带有 src 的 source 标签，就判定为就绪
-                    if (v && (v.src || v.querySelector('source')?.getAttribute('src'))) {
-                        isVideoReady = true;
-                    }
-                }
-
-                return hasImageText || hasPost || isVideoReady;
-            }, {timeout: 30000}),
-            new Promise((_, reject) =>
-                setTimeout(() => reject(new Error('核心内容容器未找到')), 30000)
-            )
-        ])
-
-        // 全面解析页面内容
-        const postData = await page.evaluate((): Promise<XiaoHeiHePostData | null> => {
-            // 1. 检测页面类型
-            const isImageTextType = !!document.querySelector('.hb-bbs-image-text');
-            const isPostType = !!document.querySelector('.hb-bbs-post');
-            const isVideoBbsType = !!document.querySelector('.hb-bbs__video');
-
-            if (!isImageTextType && !isPostType && !isVideoBbsType) {
-                throw new Error('不支持的页面结构');
-            }
-
-            // 2. 基础数据解析（通用）
-            let title = '';
-            let username = '未知用户';
-            let level = 'Lv.0';
-            let time = '未知时间';
-            let ip = '未知地区';
-            const tags: string[] = [];
-            const contentBlocks: ContentBlock[] = [];
-            let authorSection: Element | null = null;
-            let coverImage = '';
-            let videoUrl = '';
-
-            // 3. 操作数据解析（通用）
-            let likeCount = '0';
-            let favoriteCount = '0';
-            let commentCount = '0';
-
-            const operationBox = document.querySelector('.link-reply__operation-box');
-            if (operationBox) {
-                const buttons = operationBox.querySelectorAll('button');
-                buttons.forEach((button) => {
-                    const icon = button.querySelector('i');
-                    const countSpan = button.querySelector('.link-reply__operation-desc');
-                    const count = countSpan?.textContent?.trim() || '0';
-
-                    if (icon) {
-                        const className = icon.className || '';
-                        if (className.includes('thumbs-up')) {
-                            likeCount = count;
-                        } else if (className.includes('star')) {
-                            favoriteCount = count;
-                        } else if (className.includes('comment')) {
-                            commentCount = count;
-                        }
-                    }
-                });
-            }
-
-            // 4. 按类型解析内容
-            if (isImageTextType) {
-                // ===== 旧结构解析 (.hb-bbs-image-text) =====
-                const container = document.querySelector('.hb-bbs-image-text')!;
-
-                // 标题
-                title = container.querySelector('.section-title__content')?.textContent?.trim() || '无标题';
-
-                // 作者信息
-                authorSection = container.querySelector('.link-section-user');
-                if (authorSection) {
-                    username = authorSection.querySelector('.link-user__username')?.textContent?.trim() || '未知用户';
-                    level = authorSection.querySelector('.level-tag__wrapper')?.textContent?.trim() || 'Lv.0';
-                    time = authorSection.querySelector('.link-data__time')?.textContent?.trim() || '未知时间';
-                    ip = authorSection.querySelector('.link-data__ip')?.textContent?.trim() || '未知地区';
-                }
-
-                // 标签
-                container.querySelectorAll('.link-section-tags .content-tag-text').forEach(tag => {
-                    const text = tag.textContent?.trim();
-                    if (text) tags.push(text);
-                });
-
-                // 内容
-                const mainContent = container.querySelector('.image-text__content')?.textContent?.trim() || '';
-                contentBlocks.push({type: 'text', content: mainContent});
-
-                // 图片（轮播图）
-                container.querySelectorAll('.header-image__item-image img').forEach((img) => {
-                    const src = (img as HTMLImageElement).src.replace(/\?.*$/, '');
-                    contentBlocks.push({type: 'image', content: src});
-                });
-
-            } else if (isPostType) {
-                const container = document.querySelector('.hb-bbs-post')!;
-                const postContainer = container.querySelector('.post__container')!;
-
-                // 标题
-                title = postContainer.querySelector('.section-title__content')?.textContent?.trim() || '无标题';
-
-                // 作者信息
-                authorSection = postContainer.querySelector('.link-section-user');
-                if (authorSection) {
-                    username = authorSection.querySelector('.link-user__username')?.textContent?.trim() || '未知用户';
-                    level = authorSection.querySelector('.level-tag__wrapper')?.textContent?.trim() || 'Lv.0';
-
-                    // 时间/IP 在子元素中
-                    const metaData = authorSection.querySelector('.user-info__line-2');
-                    if (metaData) {
-                        time = metaData.querySelector('.link-data__time')?.textContent?.trim() || '未知时间';
-                        ip = metaData.querySelector('.link-data__ip')?.textContent?.replace('·', '').trim() || '未知地区';
-                    }
-                }
-
-                // 标签（使用第一个标签区域）
-                postContainer.querySelectorAll('.link-section-tags:first-of-type .content-tag-text').forEach(tag => {
-                    const text = tag.textContent?.trim();
-                    if (text) tags.push(text);
-                });
-
-                // 封面图片
-                const headerImageContainer = container.querySelector('.post__header-image');
-                if (headerImageContainer) {
-                    const headerImage = headerImageContainer.querySelector('img');
-                    if (headerImage) {
-                        coverImage = headerImage.src.replace(/\?.*$/, '');
-                    }
-                }
-
-                // 正文内容
-                const contentContainer = postContainer.querySelector('.post__content');
-                if (contentContainer) {
-                    // 遍历所有子节点保持顺序
-                    Array.from(contentContainer.childNodes).forEach(node => {
-                        if (node.nodeType !== Node.ELEMENT_NODE) return;
-
-                        const el = node as HTMLElement;
-
-                        // 文本段落
-                        if (el.matches('p.com-text, p.com-origin-source')) {
-                            let text = el.textContent?.trim() || '';
-                            // 特殊处理来源声明
-                            if (el.classList.contains('com-origin-source')) {
-                                text = `🔖 ${text}`;
-                            }
-                            if (text) contentBlocks.push({type: 'text', content: text});
-                        }
-
-                        // 图片
-                        else if (el.matches('div.com-img, div.hb-cpt__image')) {
-                            // 优先查找带'show'类的图片
-                            const img = el.querySelector('img.hb-cpt__image-elem.show') ||
-                                el.querySelector('img.hb-cpt__image-elem');
-
-                            if (img) {
-                                const src = (img as HTMLImageElement).src.replace(/\?.*$/, '');
-                                contentBlocks.push({type: 'image', content: src});
-                            }
-                        }
-                    });
-                }
-            } else if (isVideoBbsType) {
-                // ===== 纯视频贴结构解析 (.hb-bbs__video) =====
-                const container = document.querySelector('.hb-bbs__video')!;
-
-                // 提取视频节点与封面
-                const videoEl = container.querySelector('video') as HTMLVideoElement;
-                if (videoEl) {
-                    videoUrl = videoEl.currentSrc || videoEl.src || videoEl.querySelector('source')?.getAttribute('src') || videoEl.getAttribute('src') || '';
-                    coverImage = videoEl.getAttribute('poster') || '';
-                }
-
-                // 正文描述 (纯视频贴通常没有单独的 title，把这段描述作为内容)
-                const contentWrapper = container.querySelector('.bbs-video__content-wrapper');
-                if (contentWrapper) {
-                    title = contentWrapper.textContent?.trim() || '分享视频';
-                    contentBlocks.push({type: 'text', content: title});
-                }
-
-                // 作者信息
-                authorSection = container.querySelector('.link-section-user');
-                if (authorSection) {
-                    username = authorSection.querySelector('.link-user__username')?.textContent?.trim() || '未知用户';
-                    level = authorSection.querySelector('.level-tag__wrapper')?.textContent?.trim() || 'Lv.0';
-                }
-
-                // 独立的时间与地区信息
-                const dataSection = container.querySelector('.link-section-link-data');
-                if (dataSection) {
-                    time = dataSection.querySelector('.link-data__time')?.textContent?.trim() || '未知时间';
-                    ip = dataSection.querySelector('.link-data__ip')?.textContent?.trim() || '未知地区';
-                }
-
-                // 标签
-                container.querySelectorAll('.link-section-tags .content-tag-text').forEach(tag => {
-                    const text = tag.textContent?.trim();
-                    if (text) tags.push(text);
-                });
-            }
-
-            return {
-                // @ts-ignore
-                isImageTextType,
-                isPostType,
-                title,
-                username,
-                level,
-                time,
-                ip,
-                tags,
-                contentBlocks,
-                likeCount,
-                favoriteCount,
-                commentCount,
-                coverImage,
-                videoUrl
-            };
-        });
-
-        if (!postData) throw new Error('未找到有效内容');
-
-        // 确保页面关闭
-        if (page) await page.close().catch(() => {
-        })
-
-        // 5. 构建消息
-        let mainbody: string = ""
-
-        // 内容块
-        postData.contentBlocks.forEach((block: ContentBlock) => {
-            if (block.type === 'text') {
-                mainbody += escapeHtml(block.content + "\n");
-            } else if (block.type === 'image') {
-                mainbody += h.image(block.content).toString();
-            }
-        });
-
-        const tag = postData.tags.length ? `标签：${postData.tags.join(' | ')}\n` : ''
-        const status = `点赞: ${numeral(postData.likeCount, config)} | 收藏: ${numeral(postData.favoriteCount, config)} | 评论: ${numeral(postData.commentCount, config)}`
-
-        return {
-            platform: name,
-            title: postData.title,
-            authorName: postData.username,
-            mainbody: mainbody + tag,
-            sourceUrl: link.url,
-            stats: status,
-            coverUrl: postData.coverImage,
-            files: postData.videoUrl ? [createXiaoHeiheVideoFile(link.id, postData.videoUrl)] : []
+        const options: any = {
+            method: 'GET',
+            headers: {
+                'User-Agent': config.userAgent,
+                'Accept': 'application/json, text/plain, */*',
+                'Referer': 'https://www.xiaoheihe.cn/',
+            },
         };
-    } catch (error) {
-        logger.error('解析失败:', error)
-        return null
+        if (config.proxy_settings[name] && config.proxy) options.proxyAgent = config.proxy;
+
+        const response = await ctx.http(`https://api.xiaoheihe.cn${apiPath}?${params.toString()}`, options);
+        payload = typeof response.data === 'string' ? JSON.parse(response.data) : response.data;
+    } catch (error: any) {
+        logger.error(`请求小黑盒接口失败: ${error.message}`);
+        return null;
     }
+
+    if (payload?.status === 'show_captcha') {
+        logger.error('小黑盒接口要求人机验证（出口 IP 风控触发），本次解析跳过。');
+        return null;
+    }
+    if (payload?.status !== 'ok') {
+        logger.error(`小黑盒接口返回异常: status=${payload?.status ?? 'none'} msg=${payload?.msg ?? ''}`);
+        return null;
+    }
+
+    const post = payload.result?.link;
+    if (!post) {
+        logger.error('小黑盒接口未返回帖子内容。');
+        return null;
+    }
+    logger.debug(`小黑盒帖子字段: ${Object.keys(post).join(',')}`);
+
+    // 步骤三：构建结构化数据
+    const {body, images} = parseRichText(post.text);
+    const tags = (Array.isArray(post.content_tags) ? post.content_tags : []).map(readTagName).filter(Boolean);
+    const videoUrl = typeof post.video_url === 'string' ? post.video_url : '';
+    const coverUrl = post.video_thumb || post.thumb || images[0];
+
+    let mainbody = body;
+    const declaration = [post.post_declaration_v2?.content_source_desc, post.post_declaration_v2?.source_faq_desc]
+        .filter(Boolean).join(' · ');
+    if (declaration) mainbody += escapeHtml(`🔖 ${declaration}\n`);
+    if (tags.length) mainbody += `标签：${tags.join(' | ')}\n`;
+
+    const statsParts: string[] = [];
+    statsParts.push(`收藏: ${numeral(readCount(post, ['favour_count']) ?? 0, config)}`);
+    statsParts.push(`评论: ${numeral(readCount(post, ['comment_num']) ?? 0, config)}`);
+    const award = readCount(post, ['link_award_num']);
+    if (award) statsParts.push(`投蕉: ${numeral(award, config)}`);
+    const forward = readCount(post, ['forward_num']);
+    if (forward) statsParts.push(`转发: ${numeral(forward, config)}`);
+
+    return {
+        platform: name,
+        title: typeof post.title === 'string' ? post.title : '',
+        authorName: post.user?.username || post.user?.nickname || '',
+        mainbody: mainbody,
+        coverUrl: coverUrl,
+        files: videoUrl ? [createXiaoHeiheVideoFile(link.id, videoUrl)] : [],
+        sourceUrl: link.url,
+        stats: statsParts.join(' | '),
+    };
 }

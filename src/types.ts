@@ -236,26 +236,45 @@ export interface XhsInitialState {
     };
 }
 
-// 小黑盒内容块类型定义
-export interface ContentBlock {
-    type: 'text' | 'image';
-    content: string;
+// 小黑盒帖子接口 (/bbs/app/link/tree) 的响应结构
+export interface XiaoHeiHeUser {
+    username?: string;
+    nickname?: string;
+    [key: string]: any;
 }
 
-// 小黑盒帖子完整数据结构
-export interface XiaoHeiHePostData {
-    isImageTextType: boolean;
-    isPostType: boolean;
-    title: string;
-    username: string;
-    level: string;
-    time: string;
-    ip: string;
-    tags: string[];
-    contentBlocks: ContentBlock[];
-    likeCount: string;
-    favoriteCount: string;
-    commentCount: string;
-    coverImage: string;
-    videoUrl?: string;
+export interface XiaoHeiHeTag {
+    text?: string;
+    [key: string]: any;
+}
+
+export interface XiaoHeiHeDeclaration {
+    content_source_desc?: string;
+    source_faq_desc?: string;
+    [key: string]: any;
+}
+
+export interface XiaoHeiHeLink {
+    title?: string;
+    text?: string;
+    user?: XiaoHeiHeUser;
+    content_tags?: (XiaoHeiHeTag | string)[];
+    video_url?: string;
+    video_thumb?: string;
+    thumb?: string;
+    favour_count?: number | string;
+    comment_num?: number | string;
+    link_award_num?: number | string;
+    forward_num?: number | string;
+    post_declaration_v2?: XiaoHeiHeDeclaration;
+    [key: string]: any;
+}
+
+export interface XiaoHeiHeTreeResponse {
+    status?: string;
+    msg?: string;
+    result?: {
+        link?: XiaoHeiHeLink;
+        [key: string]: any;
+    };
 }
