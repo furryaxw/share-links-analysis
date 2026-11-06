@@ -84,6 +84,20 @@ export interface PluginConfig {
 
     youtube_ApiUrl: string;
     netease_apiUrl: string;
+    githubToken?: string;
+    githubCover?: 'off' | 'opengraph' | 'socialify';
+    // Socialify 生成参数，仅在 githubCover 为 socialify 时生效
+    socialifyTheme?: 'Light' | 'Dark';
+    socialifyFont?: string;
+    socialifyPattern?: string;
+    socialifyLanguage?: boolean;
+    socialifyOwner?: boolean;
+    socialifyName?: boolean;
+    socialifyDescription?: boolean;
+    socialifyStars?: boolean;
+    socialifyForks?: boolean;
+    socialifyIssues?: boolean;
+    socialifyPulls?: boolean;
 
     // 跨环境路径映射设置
     onebotReadDir: string;

@@ -450,6 +450,40 @@ function parseHtmlToSegments(html: string): any[] {
     return segments;
 }
 
+const CONTENT_TYPE_EXT: Record<string, string> = {
+    'image/jpeg': '.jpg',
+    'image/png': '.png',
+    'image/gif': '.gif',
+    'image/webp': '.webp',
+    'image/avif': '.avif',
+    'image/bmp': '.bmp',
+    'image/svg+xml': '.svg',
+    'video/mp4': '.mp4',
+    'video/webm': '.webm',
+    'video/quicktime': '.mov',
+    'audio/mpeg': '.mp3',
+    'audio/mp4': '.m4a',
+    'audio/aac': '.aac',
+    'audio/ogg': '.ogg',
+    'audio/wav': '.wav',
+    'audio/flac': '.flac',
+};
+
+/**
+ * 从响应头 Content-Type 推断文件扩展名，URL 路径里没有扩展名时使用
+ */
+function extensionFromContentType(contentType: string): string {
+    const mime = contentType.split(';')[0].trim().toLowerCase();
+    if (CONTENT_TYPE_EXT[mime]) return CONTENT_TYPE_EXT[mime];
+
+    const [type, subtype] = mime.split('/');
+    if ((type === 'image' || type === 'video' || type === 'audio') && subtype) {
+        const cleaned = subtype.replace(/[^a-z0-9]/g, '');
+        if (cleaned && cleaned !== 'octetstream') return `.${cleaned}`;
+    }
+    return '.bin';
+}
+
 async function downloadAndMapUrl(
     ctx: Context,
     url: string,
@@ -467,7 +501,7 @@ async function downloadAndMapUrl(
     // 1. 计算 Hash
     const hash = getFileCacheHash(url, cacheKey);
     const u = new URL(url);
-    const ext = path.extname(u.pathname).split('?')[0] || '.bin';
+    const urlExt = path.extname(u.pathname).split('?')[0];
 
     if (enableCache) {
         try {
@@ -519,22 +553,26 @@ async function downloadAndMapUrl(
     }
 
     // 2. 生成文件名 (使用 Hash 以实现去重)
-    const safeFilename = `${hash}${ext}`;
-    const actualPath = path.join(localDownloadDir, safeFilename);
-    const onebotPath = path.posix.join(onebotReadDir, safeFilename);
-    const fileUrl = `file://${onebotPath}`;
+    // URL 自带扩展名时可以直接落盘；猜不到扩展名时等拿到 Content-Type 再决定
+    const buildTarget = (ext: string) => {
+        const safeFilename = `${hash}${ext}`;
+        const actualPath = path.join(localDownloadDir, safeFilename);
+        const onebotPath = path.posix.join(onebotReadDir, safeFilename);
+        return {actualPath, fileUrl: `file://${onebotPath}`};
+    };
+    let target = urlExt ? buildTarget(urlExt) : null;
 
     // 3. 检查本地文件是否存在 (双重保险，或者应对未清理的情况)
-    if (enableCache && fs.existsSync(actualPath)) {
+    if (enableCache && target && fs.existsSync(target.actualPath)) {
         // 补写数据库
         await ctx.database.upsert('sla_file_cache', [{
             hash,
-            path: actualPath,
+            path: target.actualPath,
             url,
             created_at: Date.now()
         }]);
         if (statsRef) statsRef.fileCacheHits = (statsRef.fileCacheHits || 0) + 1;
-        return fileUrl;
+        return target.fileUrl;
     }
 
     const attemptDownload = (): Promise<string> => new Promise((resolve, reject) => {
@@ -572,6 +610,12 @@ async function downloadAndMapUrl(
                 reject(new Error(`Unexpected content type: ${contentType}`));
                 return;
             }
+
+            if (!target) {
+                target = buildTarget(extensionFromContentType(contentType));
+            }
+            const actualPath = target.actualPath;
+            const fileUrl = target.fileUrl;
 
             const pipelineAsync = promisify(pipeline);
             pipelineAsync(res, createWriteStream(actualPath))

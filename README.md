@@ -169,7 +169,7 @@ http://127.0.0.1:12001
 | Netease Music | 歌曲、节目，依赖 NeteaseCloudMusicApi 服务 |
 | QQ Music      | 常见歌曲分享链接                         |
 | Kugou Music   | 常见歌曲分享链接                         |
-| GitHub        | 仓库链接基础信息                         |
+| GitHub        | 仓库、分支/标签、发行版、用户与组织主页             |
 
 ## 指令
 

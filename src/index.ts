@@ -131,6 +131,61 @@ export const Config: Schema<PluginConfig> = Schema.intersect([
         ).default('http://127.0.0.1:3000'),
     }).description('网易云音乐设置'),
 
+    Schema.intersect([
+        Schema.object({
+            githubToken: Schema.string().role('secret').description(
+                'GitHub API Token（可选）。留空时匿名请求，速率上限为 60 次/小时；填写后提升到 5000 次/小时，<br>' +
+                '同时可以读取私有仓库与私有发行版。<br>' +
+                '在 GitHub Settings → Developer settings → Personal access tokens 创建，读取公开数据无需勾选任何权限。'
+            ).default(''),
+            githubCover: Schema.union([
+                Schema.const('off').description('不生成封面图'),
+                Schema.const('opengraph').description('GitHub 官方社交预览图：1200×600，包含仓库头像、简介、Stars/Fork 等'),
+                Schema.const('socialify').description('Socialify 生成：1280×640，主题、字体、纹理与徽标可自定义'),
+            ]).role('radio').default('off').description('封面图来源'),
+        }),
+        Schema.union([
+            Schema.object({
+                githubCover: Schema.const('socialify').required(),
+                socialifyTheme: Schema.union([
+                    Schema.const('Light').description('浅色'),
+                    Schema.const('Dark').description('深色'),
+                ]).default('Light').description('配色主题'),
+                socialifyFont: Schema.union([
+                    Schema.const('Inter'),
+                    Schema.const('JetBrains Mono'),
+                    Schema.const('KoHo'),
+                    Schema.const('Crimson Pro'),
+                    Schema.const('Bitter'),
+                    Schema.const('Roboto'),
+                    Schema.const('Source Code Pro'),
+                    Schema.const('IBM Plex Mono'),
+                    Schema.const('Raleway'),
+                    Schema.const('Poppins'),
+                ]).default('Inter').description('字体'),
+                socialifyPattern: Schema.union([
+                    Schema.const('Plus').description('加号点阵（Socialify 默认）'),
+                    Schema.const('Signal').description('砖块'),
+                    Schema.const('Charlie Brown').description('斜纹'),
+                    Schema.const('Formal Invitation').description('菱形网格'),
+                    Schema.const('Circuit Board').description('电路板'),
+                    Schema.const('Overlapping Hexagons').description('六边形'),
+                    Schema.const('Brick Wall').description('砖墙'),
+                    Schema.const('Hide').description('无纹理'),
+                ]).default('Plus').description('背景纹理'),
+                socialifyLanguage: Schema.boolean().default(true).description('显示语言徽标'),
+                socialifyOwner: Schema.boolean().default(true).description('显示仓库头像'),
+                socialifyName: Schema.boolean().default(true).description('显示仓库名'),
+                socialifyDescription: Schema.boolean().default(false).description('显示仓库简介'),
+                socialifyStars: Schema.boolean().default(true).description('显示 Stars 徽标'),
+                socialifyForks: Schema.boolean().default(true).description('显示 Forks 徽标'),
+                socialifyIssues: Schema.boolean().default(false).description('显示 Issues 徽标'),
+                socialifyPulls: Schema.boolean().default(false).description('显示 Pull Requests 徽标'),
+            }),
+            Schema.object({}),
+        ]),
+    ]).description('GitHub 解析设置'),
+
     Schema.object({
         onebotReadDir: Schema.string().description('OneBot 实现 (如 NapCat) 所在的容器或环境提供的路径前缀。').default("/app/.config/QQ/NapCat/temp"),
         localDownloadDir: Schema.string().description('与上述路径对应的、Koishi 所在的容器或主机可以访问的路径前缀。').default("/koishi/data/temp"),
