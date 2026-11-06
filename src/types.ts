@@ -240,17 +240,20 @@ export interface XhsInitialState {
 export interface XiaoHeiHeUser {
     username?: string;
     nickname?: string;
+
     [key: string]: any;
 }
 
 export interface XiaoHeiHeTag {
     text?: string;
+
     [key: string]: any;
 }
 
 export interface XiaoHeiHeDeclaration {
     content_source_desc?: string;
     source_faq_desc?: string;
+
     [key: string]: any;
 }
 
@@ -267,6 +270,7 @@ export interface XiaoHeiHeLink {
     link_award_num?: number | string;
     forward_num?: number | string;
     post_declaration_v2?: XiaoHeiHeDeclaration;
+
     [key: string]: any;
 }
 

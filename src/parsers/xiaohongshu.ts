@@ -174,7 +174,7 @@ async function resolveShareLink(
     config: PluginConfig,
     logger: Logger,
     proxy?: string
-): Promise<{noteId?: string; xsecToken?: string; noteUrl: string}> {
+): Promise<{ noteId?: string; xsecToken?: string; noteUrl: string }> {
     const direct = parseNoteLink(url);
     if (direct.noteId) return {...direct, noteUrl: url};
 
@@ -200,7 +200,7 @@ async function resolveShareLink(
 }
 
 /** 从笔记地址里取出笔记 ID 与 xsec_token */
-function parseNoteLink(url: string): {noteId?: string; xsecToken?: string} {
+function parseNoteLink(url: string): { noteId?: string; xsecToken?: string } {
     try {
         const parsed = new URL(url.replace(/&amp;/g, '&'));
         return {
@@ -300,7 +300,11 @@ async function fetchNoteHtml(ctx: Context, config: PluginConfig, logger: Logger,
  * 短链兜底：页面内 fetch 到 xhslink.com | xhslink.cn 属跨源会被拦，改为直接导航，
  * 再从最终地址里取出带 xsec_token 的笔记地址。
  */
-async function followShortLink(ctx: Context, config: PluginConfig, logger: Logger, shortUrl: string): Promise<{noteId?: string; xsecToken?: string; noteUrl: string}> {
+async function followShortLink(ctx: Context, config: PluginConfig, logger: Logger, shortUrl: string): Promise<{
+    noteId?: string;
+    xsecToken?: string;
+    noteUrl: string
+}> {
     const page = await getTransportPage(ctx, config, logger);
     await page.goto(shortUrl, {waitUntil: 'domcontentloaded', timeout: 20000});
 

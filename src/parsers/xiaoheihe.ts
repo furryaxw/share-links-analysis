@@ -143,7 +143,7 @@ function decodeEntities(value: string): string {
  * 帖子正文是富文本块：一个 JSON 数组，每块的 text 是带 <p>/<img> 的 HTML，图片只存在于 HTML 里。
  * 返回拼好的正文（文字已转义、图片为 h.image）与按出现顺序收集的图片地址。
  */
-function parseRichText(raw: any): {body: string, images: string[]} {
+function parseRichText(raw: any): { body: string, images: string[] } {
     let blocks: any[];
     if (Array.isArray(raw)) {
         blocks = raw;
