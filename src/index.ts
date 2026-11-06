@@ -3,7 +3,16 @@
 import {Context, Schema, Session} from 'koishi';
 import {init, parsers, parsers_str, processLink, resolveLinks} from './core';
 import {ParsedInfo, PluginConfig, SlaFileCache, SlaParseCache, SlaParseTimelineNode} from './types';
-import {buildTelemetryEndpoint, escapeHtml, getEffectiveSettings, getSettingsScope, isUserAdmin, sendResult, syncCookiesFromCloud} from './utils';
+import {
+    buildTelemetryEndpoint,
+    escapeHtml,
+    getEffectiveSettings,
+    getSettingsScope,
+    isUserAdmin,
+    parseBoolean,
+    sendResult,
+    syncCookiesFromCloud
+} from './utils';
 import * as fs from 'node:fs';
 import {createHash} from 'node:crypto';
 
@@ -884,7 +893,8 @@ export function apply(ctx: Context, config: PluginConfig) {
             return `当前解析器状态：\n${parserList}\nNSFW 内容：${nsfw ? '✅' : '❌'}`.trim();
         });
 
-    cmd.subcommand('.parsers [parser:string] [mode:string]', '查看/管理当前会话的解析器状态', {authority: 1})
+    cmd.subcommand('.parser [parser:string] [mode:string]', '查看/管理当前会话的解析器状态', {authority: 1})
+        .alias('.parsers')
         .action(async ({session}, parser, value) => {
             const scope = session && getSettingsScope(session);
             if (!scope) return '当前会话不可用。';
@@ -894,13 +904,14 @@ export function apply(ctx: Context, config: PluginConfig) {
                 (parsers_str as readonly string[]).includes(name);
 
             if (!isValidParser(parser)) return '请输入正确的解析器名称';
-            if (!value) return '请输入正确的模式';
-            const mode = value.trim().toLowerCase() === 'true'
+            const mode = parseBoolean(value);
+            if (mode === undefined) return '请输入正确的模式（如 true/false、enable/disable、on/off）';
 
             const data = await ctx.database.get('sla_group_settings', scope);
             const final_parsers = {...data[0]?.custom_parsers, ...{[parser]: mode}};
             const record = {guildId: scope, custom_parsers: final_parsers};
             await ctx.database.upsert('sla_group_settings', [record]);
+            await session.execute('share');
         });
 
     cmd.subcommand('.nsfw [value:string]', '设置是否允许 NSFW 内容', {authority: 1})
@@ -908,7 +919,8 @@ export function apply(ctx: Context, config: PluginConfig) {
             const scope = session && getSettingsScope(session);
             if (!scope) return '当前会话不可用。';
             if (!await canManageSettings(session)) return '权限不足'
-            const mode = value.trim().toLowerCase() === 'true'
+            const mode = parseBoolean(value);
+            if (mode === undefined) return '请输入正确的值（如 true/false、enable/disable、on/off）';
             const record = {guildId: scope, nsfw_enabled: mode};
             await ctx.database.upsert('sla_group_settings', [record]);
             await session.execute('share');
@@ -920,7 +932,8 @@ export function apply(ctx: Context, config: PluginConfig) {
             if (!scope) return '当前会话不可用。';
             if (!await canManageSettings(session)) return '权限不足'
             await ctx.database.remove('sla_group_settings', {guildId: scope});
-            return '已重置为全局默认设置。';
+            await session.send('已重置为全局默认设置。');
+            await session.execute('share');
         });
 
     cmd.subcommand('.migratecache', '迁移旧解析缓存到新时间线并校验', {authority: 4})

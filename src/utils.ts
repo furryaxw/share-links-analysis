@@ -81,6 +81,31 @@ export function buildTelemetryEndpoint(baseUrl: string, path: string): string {
 }
 
 /**
+ * 把各种表示开关的输入统一映射为布尔值
+ * 支持布尔值、数字 0/1，以及大小写不敏感的 true/false、enable/disable、on/off、yes/no、
+ * 开启/关闭 等写法
+ * @param value 待识别的输入
+ * @returns 识别成功返回 true 或 false，无法识别返回 undefined
+ */
+export function parseBoolean(value: unknown): boolean | undefined {
+    if (typeof value === 'boolean') return value;
+    if (typeof value === 'number') {
+        if (value === 1) return true;
+        if (value === 0) return false;
+        return undefined;
+    }
+    if (typeof value !== 'string') return undefined;
+
+    const normalized = value.trim().toLowerCase();
+    const truthy = ['true', 't', 'yes', 'y', 'on', 'enable', 'enabled', '1', '开', '开启', '打开', '启用', '是'];
+    const falsy = ['false', 'f', 'no', 'n', 'off', 'disable', 'disabled', '0', '关', '关闭', '禁用', '否'];
+
+    if (truthy.includes(normalized)) return true;
+    if (falsy.includes(normalized)) return false;
+    return undefined;
+}
+
+/**
  * OpenSSL EVP_BytesToKey 实现
  */
 function evpBytesToKey(password: Buffer, salt: Buffer, keyLen: number, ivLen: number) {
