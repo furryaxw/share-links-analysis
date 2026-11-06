@@ -478,7 +478,7 @@ async function processArticle(ctx: Context, config: PluginConfig, link: Link, lo
 async function processOpus(ctx: Context, config: PluginConfig, link: Link, logger: any): Promise<ParsedInfo | null> {
     const opusId = link.id;
     // B站新版动态必须传递 timezone_offset，否则部分动态获取为空或报错
-    const apiUrl = `https://api.bilibili.com/x/polymer/web-dynamic/v1/detail?timezone_offset=-480&id=${opusId}`;
+    const apiUrl = `https://api.bilibili.com/x/polymer/web-dynamic/v1/detail?timezone_offset=-480&features=itemOpusStyle&id=${opusId}`;
 
     try {
         // 获取 Cookie
