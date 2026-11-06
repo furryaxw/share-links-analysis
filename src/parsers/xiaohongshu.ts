@@ -33,7 +33,7 @@ const linkRules = [
         type: "explore" as const,
     },
     {
-        pattern: /(?:https?:\/\/)?xhslink\.com\/(?:\w\/)?([a-zA-Z0-9]+)\b/gi,
+        pattern: /(?:https?:\/\/)?xhslink\.(?:com|cn)\/(?:\w\/)?([a-zA-Z0-9]+)\b/gi,
         type: "short" as const,
     },
 ];
@@ -166,7 +166,7 @@ export async function lc_get_cookie(ctx: Context, config: PluginConfig): Promise
 
 /**
  * 从分享链接中解析出笔记 ID 与完整笔记地址。
- * 短链只跟随第一跳 (xhslink.com 的 Location 里已经带着完整地址和 token)，不需要登录态。
+ * 短链只跟随第一跳 (xhslink.com | xhslink.cn 的 Location 里已经带着完整地址和 token)，不需要登录态。
  */
 async function resolveShareLink(
     ctx: Context,
@@ -297,7 +297,7 @@ async function fetchNoteHtml(ctx: Context, config: PluginConfig, logger: Logger,
 }
 
 /**
- * 短链兜底：页面内 fetch 到 xhslink.com 属跨源会被拦，改为直接导航，
+ * 短链兜底：页面内 fetch 到 xhslink.com | xhslink.cn 属跨源会被拦，改为直接导航，
  * 再从最终地址里取出带 xsec_token 的笔记地址。
  */
 async function followShortLink(ctx: Context, config: PluginConfig, logger: Logger, shortUrl: string): Promise<{noteId?: string; xsecToken?: string; noteUrl: string}> {
